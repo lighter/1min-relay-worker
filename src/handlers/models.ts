@@ -2,35 +2,36 @@
  * Models endpoint handler
  */
 
-import { 
-  ALL_ONE_MIN_AVAILABLE_MODELS,
-  VISION_SUPPORTED_MODELS,
-  CODE_INTERPRETER_SUPPORTED_MODELS,
-  RETRIEVAL_SUPPORTED_MODELS,
-  FUNCTION_CALLING_SUPPORTED_MODELS
-} from '../constants';
-import { createSuccessResponse } from '../utils';
+import { getModelData } from "../services/model-registry";
+import type { Env, ModelObject, ModelsResponse } from "../types";
+import { createSuccessResponse } from "../utils";
 
-export function handleModelsEndpoint(): Response {
-  const models = ALL_ONE_MIN_AVAILABLE_MODELS.map(model => ({
-    id: model,
+export async function handleModelsEndpoint(env: Env): Promise<Response> {
+  const data = await getModelData(env);
+
+  const chatSet = new Set(data.chatModelIds);
+  const visionSet = new Set(data.visionModelIds);
+  const codeInterpreterSet = new Set(data.codeInterpreterModelIds);
+
+  const models: ModelObject[] = data.entries.map((entry) => ({
+    id: entry.modelId,
     object: "model",
-    created: Math.floor(Date.now() / 1000),
-    owned_by: "1min-ai",
-    permission: [],
-    root: model,
-    parent: null,
-    // Add capability flags
+    created: Math.floor(data.fetchedAt / 1000),
+    owned_by: entry.provider || "1min-ai",
+    permission: [] as unknown[],
+    root: entry.modelId,
+    parent: null as unknown,
     capabilities: {
-      vision: VISION_SUPPORTED_MODELS.includes(model),
-      code_interpreter: CODE_INTERPRETER_SUPPORTED_MODELS.includes(model),
-      retrieval: RETRIEVAL_SUPPORTED_MODELS.includes(model),
-      function_calling: FUNCTION_CALLING_SUPPORTED_MODELS.includes(model)
-    }
+      vision: visionSet.has(entry.modelId),
+      code_interpreter: codeInterpreterSet.has(entry.modelId),
+      retrieval: chatSet.has(entry.modelId),
+    },
   }));
 
-  return createSuccessResponse({
+  const response: ModelsResponse = {
     object: "list",
-    data: models
-  });
+    data: models,
+  };
+
+  return createSuccessResponse(response);
 }

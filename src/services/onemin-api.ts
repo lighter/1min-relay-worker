@@ -2,36 +2,41 @@
  * 1min.ai API service layer
  */
 
-import { Env, OneMinResponse, OneMinImageResponse } from '../types';
-import { API_ENDPOINTS } from '../constants';
-import { createErrorResponse } from '../utils';
-import { processImageUrl, uploadImageToAsset } from '../utils/image';
-import { generateUUID } from '../utils';
+import { WHISPER_MODEL_IDS } from "../constants/config";
+import type {
+  Env,
+  Message,
+  OneMinChatResponse,
+  OneMinImageResponse,
+  OneMinPromptObject,
+  OneMinRequestBody,
+} from "../types";
+import { ApiError } from "../utils/errors";
+import { processImageUrl, uploadImageToAsset } from "../utils/image";
+import { extractTextFromMessageContent } from "../utils/message-processing";
+import type { WebSearchConfig } from "../utils/model-parser";
+import { isVisionModel } from "./model-registry";
 
-// Helper function to extract text content from message content (string or array)
-function extractTextFromContent(content: string | Array<{ type: string; text?: string; image_url?: { url: string } }>): string {
-  if (typeof content === 'string') {
-    return content;
-  }
-
-  // Extract text from array content
-  const textParts: string[] = [];
-  for (const item of content) {
-    if (item.type === 'text' && item.text) {
-      textParts.push(item.text);
-    }
-  }
-  return textParts.join('\n');
+// Map upstream HTTP status to a safe client-facing error message
+function sanitizeUpstreamError(status: number): string {
+  if (status === 401) return "Authentication failed with upstream provider";
+  if (status === 403) return "Access denied by upstream provider";
+  if (status === 404) return "Resource not found on upstream provider";
+  if (status === 429) return "Rate limited by upstream provider";
+  if (status >= 500) return "Upstream provider returned an internal error";
+  return "Upstream request failed";
 }
 
-// Helper function to format conversation for the API
-// Converts message array to format expected by 1min.ai API
-function formatConversationHistory(messages: any[], newInput: string = ''): string {
+// Converts message array to a single prompt string for the 1min.ai API
+function formatConversationHistory(
+  messages: Message[],
+  newInput: string = "",
+): string {
   let formattedHistory = "";
 
   for (const message of messages) {
     const role = message.role;
-    const content = extractTextFromContent(message.content);
+    const content = extractTextFromMessageContent(message.content);
 
     if (role === "system") {
       formattedHistory += `System: ${content}\n\n`;
@@ -39,10 +44,11 @@ function formatConversationHistory(messages: any[], newInput: string = ''): stri
       formattedHistory += `Human: ${content}\n\n`;
     } else if (role === "assistant") {
       formattedHistory += `Assistant: ${content}\n\n`;
+    } else if (role === "tool" || role === "function") {
+      formattedHistory += `Tool: ${content}\n\n`;
     }
   }
 
-  // Add the new input if provided
   if (newInput) {
     formattedHistory += `Human: ${newInput}\n\n`;
   }
@@ -57,153 +63,323 @@ export class OneMinApiService {
     this.env = env;
   }
 
-  async sendChatRequest(requestBody: any, isStreaming: boolean = false, apiKey?: string): Promise<Response> {
+  async sendChatRequest(
+    requestBody: OneMinRequestBody,
+    isStreaming: boolean = false,
+    apiKey?: string,
+  ): Promise<Response> {
     const apiUrl = isStreaming
-      ? this.env.ONE_MIN_CONVERSATION_API_STREAMING_URL
-      : this.env.ONE_MIN_API_URL;
+      ? `${this.env.ONE_MIN_CHAT_API_URL}?isStreaming=true`
+      : this.env.ONE_MIN_CHAT_API_URL;
 
     const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
+      "Content-Type": "application/json",
     };
 
-    // Add API key if provided
     if (apiKey) {
-      headers['API-KEY'] = apiKey;
+      headers["API-KEY"] = apiKey;
     }
 
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(requestBody)
-    });
+    try {
+      const response = await fetch(apiUrl, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(requestBody),
+      });
 
-    if (!response.ok) {
-      throw new Error(`1min.ai API error: ${response.status} ${response.statusText}`);
+      if (!response.ok) {
+        const rawErrorBody = await response.text().catch(() => "(unreadable)");
+        const errorBody = rawErrorBody.slice(0, 500);
+        console.error(
+          `1min.ai API error: ${response.status} ${response.statusText}`,
+          {
+            url: apiUrl,
+            model: requestBody.model,
+            errorBody,
+          },
+        );
+
+        // If the error might be related to webSearch, try graceful degradation
+        const webSearch =
+          requestBody.promptObject?.settings?.webSearchSettings?.webSearch;
+        if (response.status === 400 && webSearch) {
+          console.warn(
+            "Attempting graceful degradation: removing webSearch parameters",
+          );
+          const fallbackRequestBody =
+            this.createFallbackRequestBody(requestBody);
+
+          const fallbackResponse = await fetch(apiUrl, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(fallbackRequestBody),
+          });
+
+          if (fallbackResponse.ok) {
+            console.warn("Graceful degradation successful");
+            return fallbackResponse;
+          }
+        }
+
+        throw new ApiError(
+          sanitizeUpstreamError(response.status),
+          response.status,
+        );
+      }
+
+      return response;
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      console.error("Network error in sendChatRequest:", error);
+      throw error;
     }
-
-    return response;
   }
 
-  async sendImageRequest(requestBody: any, apiKey?: string): Promise<OneMinImageResponse> {
+  private createFallbackRequestBody(
+    originalRequestBody: OneMinRequestBody,
+  ): OneMinRequestBody {
+    const { settings, ...restPrompt } = originalRequestBody.promptObject;
+    return {
+      ...originalRequestBody,
+      promptObject: {
+        ...restPrompt,
+        settings: settings
+          ? {
+              ...settings,
+              webSearchSettings: { webSearch: false },
+            }
+          : undefined,
+      },
+    };
+  }
+
+  async sendImageRequest(
+    requestBody: OneMinRequestBody,
+    apiKey?: string,
+  ): Promise<OneMinImageResponse> {
     const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
+      "Content-Type": "application/json",
     };
 
-    // Add API key if provided
     if (apiKey) {
-      headers['API-KEY'] = apiKey;
+      headers["API-KEY"] = apiKey;
     }
 
-    const response = await fetch(this.env.ONE_MIN_API_URL + "?isStreaming=false", {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(requestBody)
-    });
+    const response = await fetch(
+      `${this.env.ONE_MIN_API_URL}?isStreaming=false`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(requestBody),
+      },
+    );
 
     if (!response.ok) {
-      throw new Error(`1min.ai API error: ${response.status} ${response.statusText}`);
+      const rawErrorBody = await response.text().catch(() => "(unreadable)");
+      const errorBody = rawErrorBody.slice(0, 500);
+      console.error("1min.ai image API error:", errorBody);
+      throw new ApiError(
+        sanitizeUpstreamError(response.status),
+        response.status,
+      );
     }
 
     const data = await response.json();
     return data as OneMinImageResponse;
   }
 
-  async buildChatRequestBody(messages: any[], model: string, apiKey: string, temperature?: number, maxTokens?: number): Promise<any> {
-    // Process images and check for vision model support
+  async buildChatRequestBody(
+    messages: Message[],
+    model: string,
+    apiKey: string,
+    _temperature?: number,
+    _maxTokens?: number,
+    webSearchConfig?: WebSearchConfig,
+  ): Promise<OneMinRequestBody> {
+    // Process images from the latest user message
     const imagePaths: string[] = [];
-    let hasImages = false;
+    const latestMessage =
+      messages && messages.length > 0 ? messages[messages.length - 1] : null;
 
-    for (const message of messages || []) {
-      if (Array.isArray(message.content)) {
-        for (const item of message.content) {
-          if (item.type === 'image_url' && item.image_url?.url) {
-            hasImages = true;
+    if (latestMessage && Array.isArray(latestMessage.content)) {
+      for (const item of latestMessage.content) {
+        if (item.type === "image_url" && item.image_url?.url) {
+          if (!(await isVisionModel(model, this.env))) {
+            throw new ApiError(
+              `Model '${model}' does not support image inputs`,
+              400,
+            );
+          }
 
-            try {
-              // Process and upload image
-              const imageData = await processImageUrl(item.image_url.url);
-              const imagePath = await uploadImageToAsset(imageData, apiKey, this.env.ONE_MIN_ASSET_URL);
-              if (imagePath) {
-                imagePaths.push(imagePath);
-              }
-            } catch (error) {
-              console.error('Error processing image:', error);
-              // Continue processing other images even if one fails
-            }
+          try {
+            const imageData = await processImageUrl(item.image_url.url);
+            const imagePath = await uploadImageToAsset(
+              imageData,
+              apiKey,
+              this.env.ONE_MIN_ASSET_URL,
+            );
+            imagePaths.push(imagePath);
+          } catch (error) {
+            console.error("Error processing image:", error);
+            throw new ApiError("Failed to process image attachment", 422);
           }
         }
       }
     }
 
-    // Format messages for the API call
     const formattedHistory = formatConversationHistory(messages, "");
 
-    // Prepare request to 1min.ai API - use different type for images
-    if (hasImages && imagePaths.length > 0) {
-      return {
-        type: "CHAT_WITH_IMAGE",
-        model: model,
-        promptObject: {
-          prompt: formattedHistory,
+    const promptObject: OneMinPromptObject = {
+      prompt: formattedHistory,
+      settings: {
+        historySettings: {
           isMixed: false,
-          imageList: imagePaths
-        }
-      };
-    } else {
-      return {
-        type: "CHAT_WITH_AI",
-        model: model,
-        promptObject: {
-          prompt: formattedHistory,
-          isMixed: false,
-          webSearch: false
-        }
+        },
+        withMemories: false,
+      },
+    };
+
+    // Add web search settings if enabled
+    if (webSearchConfig?.webSearch) {
+      promptObject.settings = {
+        ...promptObject.settings,
+        webSearchSettings: {
+          webSearch: true,
+          numOfSite: webSearchConfig.numOfSite,
+          maxWord: webSearchConfig.maxWord,
+        },
       };
     }
-  }
 
-  buildStreamingChatRequestBody(messages: any[], model: string, temperature?: number, maxTokens?: number): any {
-    // Process images and check for vision model support
-    const imagePaths: string[] = [];
-    let hasImages = false;
-
-    for (const message of messages || []) {
-      if (Array.isArray(message.content)) {
-        for (const item of message.content) {
-          if (item.type === 'image_url' && item.image_url?.url) {
-            hasImages = true;
-            // Note: Image processing would need to be implemented here
-            // For now, we'll just mark that images are present
-          }
-        }
-      }
+    // Add image attachments if any were uploaded
+    if (imagePaths.length > 0) {
+      promptObject.attachments = {
+        images: imagePaths,
+      };
     }
 
-    // Format messages for the API call
-    const formattedHistory = formatConversationHistory(messages, "");
-
-    // Prepare request to 1min.ai API
     return {
-      type: "CHAT_WITH_AI",
+      type: "UNIFY_CHAT_WITH_AI",
       model: model,
-      promptObject: {
-        prompt: formattedHistory,
-        isMixed: hasImages,
-        webSearch: false,
-        ...(hasImages && imagePaths.length > 0 && { imagePaths })
-      }
+      promptObject,
     };
   }
 
-  buildImageRequestBody(prompt: string, model: string, n?: number, size?: string): any {
+  buildImageRequestBody(
+    prompt: string,
+    model: string,
+    n?: number,
+    size?: string,
+  ): OneMinRequestBody {
     return {
       type: "IMAGE_GENERATOR",
       model: model,
       promptObject: {
         prompt: prompt,
         n: n ?? 1,
-        size: size ?? "1024x1024"
-      }
+        size: size ?? "1024x1024",
+      },
     };
+  }
+
+  /**
+   * Google Speech models use `language` in promptObject;
+   * Whisper-1 uses `response_format` instead.
+   */
+  buildSpeechToTextRequestBody(
+    audioUrl: string,
+    model: string,
+    language?: string,
+    responseFormat?: string,
+    prompt?: string,
+    temperature?: number,
+  ): OneMinRequestBody {
+    const isWhisperModel = WHISPER_MODEL_IDS.has(model);
+
+    const promptObject: OneMinPromptObject = {
+      prompt: prompt ?? "",
+      audioUrl,
+    };
+
+    if (isWhisperModel) {
+      promptObject.response_format = responseFormat ?? "text";
+      if (language) {
+        promptObject.language = language;
+      }
+      if (temperature !== undefined) {
+        promptObject.temperature = temperature;
+      }
+    } else {
+      // Google Speech models use language instead of response_format/temperature
+      if (language) {
+        promptObject.language = language;
+      }
+    }
+
+    return {
+      type: "SPEECH_TO_TEXT",
+      model,
+      promptObject,
+    };
+  }
+
+  buildAudioTranslatorRequestBody(
+    audioUrl: string,
+    model: string,
+    responseFormat?: string,
+    temperature?: number,
+    prompt?: string,
+  ): OneMinRequestBody {
+    const promptObject: OneMinPromptObject = {
+      prompt: prompt ?? "",
+      audioUrl,
+    };
+
+    // Only Whisper models support response_format and temperature
+    if (WHISPER_MODEL_IDS.has(model)) {
+      promptObject.response_format = responseFormat ?? "text";
+      if (temperature !== undefined) {
+        promptObject.temperature = temperature;
+      }
+    }
+
+    return {
+      type: "AUDIO_TRANSLATOR",
+      model,
+      promptObject,
+    };
+  }
+
+  async sendAudioRequest(
+    requestBody: OneMinRequestBody,
+    apiKey?: string,
+  ): Promise<OneMinChatResponse> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+
+    if (apiKey) {
+      headers["API-KEY"] = apiKey;
+    }
+
+    const response = await fetch(
+      `${this.env.ONE_MIN_API_URL}?isStreaming=false`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(requestBody),
+      },
+    );
+
+    if (!response.ok) {
+      const rawError = await response.text().catch(() => "(unreadable)");
+      console.error("1min.ai audio API error:", rawError.slice(0, 500));
+      throw new ApiError(
+        sanitizeUpstreamError(response.status),
+        response.status,
+      );
+    }
+
+    return (await response.json()) as OneMinChatResponse;
   }
 }

@@ -1,38 +1,35 @@
 /**
  * Response utilities for consistent API responses
+ *
+ * CORS headers are handled globally by the Hono CORS middleware (src/middleware/cors.ts).
+ * Response utilities should NOT add CORS headers manually.
  */
 
-import { CORS_HEADERS } from '../constants';
+import type { OneMinChatResponse } from "../types";
 
-export function createErrorResponse(message: string, status: number = 400): Response {
-  return new Response(JSON.stringify({
-    error: {
-      message,
-      type: 'invalid_request_error',
-      code: null
-    }
-  }), {
-    status,
-    headers: {
-      'Content-Type': 'application/json',
-      ...CORS_HEADERS
-    }
-  });
+/**
+ * Extract text content from a 1min.ai response, with consistent fallback logic.
+ */
+export function extractOneMinContent(data: OneMinChatResponse): string {
+  const content =
+    data.aiRecord?.aiRecordDetail?.resultObject?.[0] || data.content;
+  if (!content) {
+    console.warn(
+      "Empty response from 1min.ai — no resultObject or content field",
+    );
+    return "";
+  }
+  return content;
 }
 
-export function createSuccessResponse(data: any, status: number = 200): Response {
+export function createSuccessResponse<T = unknown>(
+  data: T,
+  status: number = 200,
+): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
-      'Content-Type': 'application/json',
-      ...CORS_HEADERS
-    }
-  });
-}
-
-export function createCorsResponse(): Response {
-  return new Response(null, {
-    status: 200,
-    headers: CORS_HEADERS
+      "Content-Type": "application/json",
+    },
   });
 }

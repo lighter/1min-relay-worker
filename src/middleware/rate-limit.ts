@@ -1,10 +1,10 @@
 /**
  * Rate limiting middleware using Cloudflare KV
+ * Uses a simple sliding-window counter instead of storing full timestamp arrays.
  */
 
-import { Env, RateLimitRecord, RateLimitConfig } from '../types';
-import { RATE_LIMIT_CONFIG } from '../constants';
-import { createErrorResponse } from '../utils';
+import { RATE_LIMIT_CONFIG } from "../constants";
+import type { Env, RateLimitConfig, RateLimitRecord } from "../types";
 
 export class RateLimiter {
   private env: Env;
@@ -15,93 +15,91 @@ export class RateLimiter {
     this.config = config;
   }
 
-  async checkRateLimit(clientId: string, tokenCount: number = 0): Promise<{ allowed: boolean; response?: Response }> {
+  async checkRateLimit(
+    clientId: string,
+    tokenCount: number = 0,
+  ): Promise<{ allowed: boolean }> {
     if (!this.env.RATE_LIMIT_STORE) {
-      // If no KV store is configured, allow all requests
       return { allowed: true };
     }
 
     const now = Date.now();
-    const windowStart = now - this.config.windowMs;
 
     try {
-      // Get existing rate limit record
       const existingRecord = await this.env.RATE_LIMIT_STORE.get(clientId);
-      let record: RateLimitRecord = existingRecord 
+      let record: RateLimitRecord = existingRecord
         ? JSON.parse(existingRecord)
-        : { timestamps: [], tokenCount: 0 };
+        : { requestCount: 0, tokenCount: 0, windowStart: now };
 
-      // Filter out timestamps outside the current window
-      record.timestamps = record.timestamps.filter(timestamp => timestamp > windowStart);
+      // Reset if window has expired
+      if (now - record.windowStart >= this.config.windowMs) {
+        record = { requestCount: 0, tokenCount: 0, windowStart: now };
+      }
 
       // Check request count limit
-      if (record.timestamps.length >= this.config.maxRequests) {
-        return {
-          allowed: false,
-          response: createErrorResponse(
-            `Rate limit exceeded. Maximum ${this.config.maxRequests} requests per minute allowed.`,
-            429
-          )
-        };
+      if (record.requestCount >= this.config.maxRequests) {
+        return { allowed: false };
       }
 
       // Check token count limit (if configured)
-      if (this.config.maxTokens && record.tokenCount + tokenCount > this.config.maxTokens) {
-        return {
-          allowed: false,
-          response: createErrorResponse(
-            `Token rate limit exceeded. Maximum ${this.config.maxTokens} tokens per minute allowed.`,
-            429
-          )
-        };
+      if (
+        this.config.maxTokens &&
+        record.tokenCount + tokenCount > this.config.maxTokens
+      ) {
+        return { allowed: false };
       }
 
-      // Update record
-      record.timestamps.push(now);
-      record.tokenCount = record.tokenCount + tokenCount;
+      // Update counters
+      record.requestCount += 1;
+      record.tokenCount += tokenCount;
 
-      // Reset token count if we're starting a new window
-      if (record.timestamps.length === 1) {
-        record.tokenCount = tokenCount;
-      }
-
-      // Store updated record with TTL
-      await this.env.RATE_LIMIT_STORE.put(
-        clientId,
-        JSON.stringify(record),
-        { expirationTtl: Math.ceil(this.config.windowMs / 1000) + 10 }
-      );
+      await this.env.RATE_LIMIT_STORE.put(clientId, JSON.stringify(record), {
+        expirationTtl: Math.ceil(this.config.windowMs / 1000) + 60,
+      });
 
       return { allowed: true };
     } catch (error) {
-      console.error('Rate limiting error:', error);
-      // On error, allow the request to proceed
+      console.error("Rate limiting error:", error);
       return { allowed: true };
     }
   }
 
-  private getClientId(request: Request): string {
-    // Try to get client ID from various sources
-    const authHeader = request.headers.get('Authorization');
-    if (authHeader) {
-      return `auth:${authHeader.substring(0, 20)}`;
-    }
-
-    const cfConnectingIp = request.headers.get('CF-Connecting-IP');
-    if (cfConnectingIp) {
-      return `ip:${cfConnectingIp}`;
-    }
-
-    const xForwardedFor = request.headers.get('X-Forwarded-For');
-    if (xForwardedFor) {
-      return `ip:${xForwardedFor.split(',')[0].trim()}`;
-    }
-
-    return 'anonymous';
-  }
-
-  async middleware(request: Request, tokenCount: number = 0): Promise<{ allowed: boolean; response?: Response }> {
-    const clientId = this.getClientId(request);
+  async middleware(
+    request: Request,
+    tokenCount: number = 0,
+  ): Promise<{ allowed: boolean }> {
+    const clientId = await getClientId(request);
     return this.checkRateLimit(clientId, tokenCount);
   }
+}
+
+/**
+ * Extract client identifier from request headers for rate limiting.
+ */
+export async function getClientId(request: Request): Promise<string> {
+  const authHeader = request.headers.get("Authorization");
+  if (authHeader) {
+    const hashBuffer = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(authHeader),
+    );
+    const hashHex = Array.from(new Uint8Array(hashBuffer))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("")
+      .slice(0, 16);
+    return `auth:${hashHex}`;
+  }
+
+  const cfConnectingIp = request.headers.get("CF-Connecting-IP");
+  if (cfConnectingIp) {
+    return `ip:${cfConnectingIp}`;
+  }
+
+  const xForwardedFor = request.headers.get("X-Forwarded-For");
+  if (xForwardedFor) {
+    const firstIp = xForwardedFor.split(",")[0];
+    return firstIp ? `ip:${firstIp.trim()}` : "anonymous";
+  }
+
+  return "anonymous";
 }

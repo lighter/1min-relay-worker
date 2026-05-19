@@ -11,20 +11,17 @@
   "observability": {
     "enabled": true,
   },
-
   /**
    * Smart Placement
    * Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
    */
   // "placement": { "mode": "smart" },
-
   /**
    * Bindings
    * Bindings allow your Worker to interact with resources on the Cloudflare Developer Platform, including
    * databases, object storage, AI inference, real-time communication and more.
    * https://developers.cloudflare.com/workers/runtime-apis/bindings/
    */
-
   /**
    * Environment Variables
    * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
@@ -34,31 +31,27 @@
    * Note: Use secrets to store sensitive data.
    * https://developers.cloudflare.com/workers/configuration/secrets/
    */
-
   "vars": {
     "ONE_MIN_CHAT_API_URL": "https://api.1min.ai/api/chat-with-ai",
     "ONE_MIN_API_URL": "https://api.1min.ai/api/features",
     "ONE_MIN_ASSET_URL": "https://api.1min.ai/api/assets",
     "ONE_MIN_MODELS_API_URL": "https://api.1min.ai/models",
   },
-
-	"kv_namespaces": [
-		{
-		  "binding": "RATE_LIMIT_STORE",
-		  "id": "1dae0fa563454e178153e608d4d75ae1" // IMPORTANT: Change this to your KV namespace ID
+  "kv_namespaces": [
+    {
+      "binding": "RATE_LIMIT_STORE",
+      "id": "1dae0fa563454e178153e608d4d75ae1" // IMPORTANT: Change this to your KV namespace ID
     },
     {
       "binding": "MODEL_CACHE",
-      "id": "a0075251c12d4ae89ff4a73dbc571827"
+      "id": "7f3a91c2d84b4e53a1f92bc6e7d441ab"
     },
   ],
-
   /**
    * Static Assets
    * https://developers.cloudflare.com/workers/static-assets/binding/
    */
   // "assets": { "directory": "./public/", "binding": "ASSETS" },
-
   /**
    * Service Bindings (communicate between multiple Workers)
    * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
